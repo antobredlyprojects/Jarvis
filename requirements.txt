@@ -1,0 +1,26 @@
+# J.A.R.V.I.S. Desktop Voice Assistant — Python Dependencies
+# Install: pip install -r requirements.txt
+# Also requires: espeak-ng system package (for Kokoro TTS fallback)
+
+# Core
+torch
+torchaudio
+numpy
+requests
+
+# Voice I/O
+sounddevice
+soundfile
+SpeechRecognition
+
+# TTS — Kokoro 82M (local, free, high quality)
+kokoro>=0.9.4
+
+# VAD — Silero (loaded via torch.hub, no pip install needed)
+
+# PC Control (optional, gracefully degrade if missing)
+# pyautogui
+# psutil
+# mss
+# pillow
+# pyperclip

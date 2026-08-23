@@ -8,24 +8,24 @@ Architecture:
                  →  Silero VAD  (speech detection + barge-in)
                  →  SpeechRecognition (Google STT on captured segments)
                  →  Backend  (Groq AI)
-                 →  TTS queue thread  (edge-tts + sounddevice.play)
+                 →  TTS queue thread  (Kokoro 82M + sounddevice.play)
 
 Prerequisites:
-  pip install torch torchaudio sounddevice soundfile edge-tts
+  pip install torch torchaudio sounddevice soundfile kokoro
   pip install SpeechRecognition requests numpy pyperclip
   pip install pyautogui psutil mss pillow
 =============================================================================
 """
 
-import os, sys, time, uuid, json, queue, asyncio
+import os, sys, time, uuid, json, queue
 import tempfile, datetime, threading, subprocess, webbrowser
 import numpy as np
 import requests
 import speech_recognition as sr
-import edge_tts
 import sounddevice as sd
 import soundfile as sf
 import torch
+from kokoro import KPipeline
 from app_launcher import launch_app
 
 # ── Optional imports ──────────────────────────────────────────────────────────
@@ -42,9 +42,10 @@ except: HAS_MSS = False
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
 SERVER_URL      = "http://localhost:3000"
-TTS_VOICE       = "en-GB-RyanNeural"
-TTS_RATE        = "-5%"           # slightly below normal — calm, composed
-TTS_PITCH       = "-3Hz"           # slightly deeper — authoritative without booming
+KOKORO_VOICE    = "bm_george"     # British male — calm, composed, JARVIS-like
+KOKORO_LANG     = "b"             # 'b' = British English
+KOKORO_RATE     = 1.0             # speech speed multiplier (1.0 = normal)
+KOKORO_SAMPLE   = 24000           # Kokoro outputs at 24kHz
 
 SAMPLE_RATE     = 16000          # Silero VAD requires 16kHz
 BLOCK_SIZE      = 512            # ~32ms per block at 16kHz
@@ -52,6 +53,13 @@ VAD_THRESHOLD   = 0.5            # Silero confidence threshold (0-1)
 SPEECH_PAD_MS   = 300            # ms of silence after speech before cutting
 MIN_SPEECH_MS   = 400            # ignore segments shorter than this
 MAX_SPEECH_SEC  = 15             # hard cap on a single utterance
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  KOKORO TTS  — load pipeline once at startup
+# ═══════════════════════════════════════════════════════════════════════════════
+print("-> Loading Kokoro TTS pipeline...")
+_kokoro_pipeline = KPipeline(lang_code=KOKORO_LANG)
+print(f"   Voice: {KOKORO_VOICE} | Lang: British English | Rate: {KOKORO_RATE}x")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SILERO VAD  — load once at startup
@@ -403,18 +411,15 @@ def naturalize_text(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  NATURAL SPEECH ENGINE — chunked synthesis with human rhythm
+#  KOKORO TTS ENGINE — local, free, natural-sounding synthesis
 # ═══════════════════════════════════════════════════════════════════════════════
-_tts_loop: asyncio.AbstractEventLoop = None
 def _split_into_sentences(text: str) -> list:
     """Split text into natural sentence chunks for TTS.
     
-    Edge-TTS can sound flat on long sentences. Breaking into chunks
-    with slight pauses between them creates natural breathing rhythm.
+    Breaking into chunks with slight pauses between them creates
+    natural breathing rhythm — like a person pausing between thoughts.
     """
-    # Split on sentence boundaries, keeping the punctuation
     chunks = _re.split(r"(?<=[.!?])\s+", text)
-    # Merge very short chunks (< 15 chars) with previous
     merged = []
     for chunk in chunks:
         chunk = chunk.strip()
@@ -426,77 +431,61 @@ def _split_into_sentences(text: str) -> list:
             merged.append(chunk)
     return merged if merged else [text]
 
-def _make_silence(duration_ms: int = 180, sr: int = None) -> np.ndarray:
+def _make_silence(duration_ms: int = 180) -> np.ndarray:
     """Generate a short silence buffer for natural pauses between phrases."""
-    if sr is None:
-        sr = SAMPLE_RATE
-    n_samples = int(sr * duration_ms / 1000)
+    n_samples = int(KOKORO_SAMPLE * duration_ms / 1000)
     return np.zeros(n_samples, dtype=np.float32)
 
-async def _synthesise_chunk(text: str) -> tuple:
-    """Synthesize a single text chunk to numpy audio + sample rate."""
-    tmp = os.path.join(tempfile.gettempdir(), f"jarvis_{uuid.uuid4().hex}.mp3")
-    try:
-        comm = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
-        await comm.save(tmp)
-        audio_data, sr = sf.read(tmp, dtype="float32")
-        return audio_data, sr
-    finally:
-        try: os.remove(tmp)
-        except OSError: pass
+def _synthesise_chunk(text: str) -> np.ndarray:
+    """Synthesize a single text chunk to numpy audio via Kokoro."""
+    all_audio = []
+    # KPipeline yields (graphemes, phonemes, audio) tuples
+    for _, _, audio in _kokoro_pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_RATE):
+        if audio is not None and len(audio) > 0:
+            all_audio.append(audio)
+    if not all_audio:
+        return np.array([], dtype=np.float32)
+    return np.concatenate(all_audio)
 
-async def _synthesise_and_play(text: str):
-    """Natural speech synthesis: chunk → synthesize → join with silence gaps.
+def _synthesise_and_play(text: str):
+    """Natural speech synthesis: chunk → Kokoro → join with silence gaps.
     
-    The key insight: human speech has natural pauses between sentences.
-    A single long TTS pass sounds flat and robotic. By splitting into
-    chunks, synthesizing each, and joining with silence gaps,
-    the result sounds like a person actually breathing between thoughts.
+    Kokoro generates audio locally (no API calls, no cost).
+    Splitting into sentence chunks with silence gaps creates
+    the natural breathing rhythm of human speech.
     """
-    # Naturalize the text first
     text = naturalize_text(text)
-
-    # Split into sentence chunks
     chunks = _split_into_sentences(text)
 
-    # Synthesize each chunk and concatenate with silence gaps
     all_audio = []
-    detected_sr = None
     for i, chunk in enumerate(chunks):
         if _interrupt_event.is_set():
-            return  # stop immediately if interrupted
+            return
 
         try:
-            chunk_audio, sr = await _synthesise_chunk(chunk)
-            all_audio.append(chunk_audio)
-            if detected_sr is None:
-                detected_sr = sr
+            chunk_audio = _synthesise_chunk(chunk)
+            if len(chunk_audio) > 0:
+                all_audio.append(chunk_audio)
         except Exception as e:
             print(f"[TTS] Chunk {i} failed: {e}")
             continue
 
-        # Add a natural pause between sentences (not after the last)
+        # Add natural pause between sentences
         if i < len(chunks) - 1:
-            # Longer pause after periods, shorter after commas
             pause_ms = 220 if chunk.rstrip().endswith((".", "!", "?")) else 120
-            all_audio.append(_make_silence(pause_ms, detected_sr or SAMPLE_RATE))
+            all_audio.append(_make_silence(pause_ms))
 
     if not all_audio:
         print("[TTS] All chunks failed.")
         return
 
-    if detected_sr is None:
-        detected_sr = SAMPLE_RATE
-
-    # Concatenate all chunks + silence into one audio stream
     full_audio = np.concatenate(all_audio)
 
     _interrupt_event.clear()
     set_state(State.SPEAKING)
     ui_event("status", "Speaking...")
 
-    sd.play(full_audio, detected_sr)
-    # Poll for interrupt instead of blocking with sd.wait()
+    sd.play(full_audio, KOKORO_SAMPLE)
     while sd.get_stream().active:
         if _interrupt_event.is_set():
             sd.stop()
@@ -510,14 +499,11 @@ async def _synthesise_and_play(text: str):
     ui_event("status", "Listening...")
 
 def tts_thread_fn():
-    global _tts_loop
-    _tts_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_tts_loop)
     while True:
         text = _tts_queue.get()
         if text is None:
             break
-        _tts_loop.run_until_complete(_synthesise_and_play(text))
+        _synthesise_and_play(text)
         _tts_queue.task_done()
 
 def speak(text: str):
@@ -951,7 +937,7 @@ def main():
     monitor_t.start()
 
     print(f"\n-> Server   : {SERVER_URL}")
-    print(f"-> Voice    : {TTS_VOICE}")
+    print(f"-> Voice    : Kokoro 82M ({KOKORO_VOICE})")
     print(f"-> VAD      : Silero (threshold={VAD_THRESHOLD})")
     print(f"-> Commands : {len(COMMANDS)} loaded")
     print("\nSay 'exit' or 'shut down' to stop.")

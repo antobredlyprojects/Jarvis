@@ -3,26 +3,29 @@ const fs   = require("fs");
 const path = require("path");
 const os   = require("os");
 
-const TTS_VOICE = process.env.TTS_VOICE || "en-GB-RyanNeural";
-const TTS_RATE  = process.env.TTS_RATE  || "-5%";   // calm, composed
-const TTS_PITCH = process.env.TTS_PITCH || "-3Hz";   // authoritative without booming
+const KOKORO_VOICE = process.env.KOKORO_VOICE || "bm_george";
+const KOKORO_LANG  = process.env.KOKORO_LANG  || "b";       // British English
+const KOKORO_RATE  = process.env.KOKORO_RATE  || "1.0";     // speech speed
+
+// Path to the Python wrapper script (same directory as this file's parent)
+const TTS_SCRIPT = path.join(__dirname, "..", "..", "tts_kokoro.py");
 
 /**
- * Synthesise speech using the edge-tts Python CLI.
- * Requires: pip install edge-tts --break-system-packages
- * Returns a Buffer of MP3 audio data.
+ * Synthesise speech using Kokoro 82M (local, free).
+ * Spawns a Python process that writes a WAV file, then reads it back.
+ * Returns a Buffer of WAV audio data.
  */
 function synthesise(text) {
   return new Promise((resolve, reject) => {
-    const outPath = path.join(os.tmpdir(), `jarvis_tts_${Date.now()}_${Math.random().toString(36).slice(2)}.mp3`);
+    const outPath = path.join(os.tmpdir(), `jarvis_tts_${Date.now()}_${Math.random().toString(36).slice(2)}.wav`);
 
     const args = [
-      "-m", "edge_tts",
-      "--voice", TTS_VOICE,
-      `--rate=${TTS_RATE}`,
-      `--pitch=${TTS_PITCH}`,
-      "--text", text,
-      "--write-media", outPath,
+      TTS_SCRIPT,
+      "--output", outPath,
+      "--voice", KOKORO_VOICE,
+      "--lang", KOKORO_LANG,
+      "--rate", KOKORO_RATE,
+      text,
     ];
 
     // Try python3 first, fall back to python (for Windows compatibility)
@@ -34,11 +37,11 @@ function synthesise(text) {
 
     proc.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(`edge-tts exited with code ${code}: ${stderr}`));
+        fs.unlink(outPath, () => {}); // clean up
+        return reject(new Error(`Kokoro TTS exited with code ${code}: ${stderr}`));
       }
       fs.readFile(outPath, (err, data) => {
-        // Clean up temp file regardless of outcome
-        fs.unlink(outPath, () => {});
+        fs.unlink(outPath, () => {}); // clean up temp file
         if (err) return reject(err);
         resolve(data);
       });
