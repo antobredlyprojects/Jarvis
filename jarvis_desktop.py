@@ -110,7 +110,6 @@ def get_state() -> str:
 #  SHARED QUEUES
 # ═══════════════════════════════════════════════════════════════════════════════
 _speech_segment_queue : queue.Queue = queue.Queue()   # raw np arrays → STT thread
-_tts_queue            : queue.Queue = queue.Queue()   # text → TTS thread
 _interrupt_event      : threading.Event = threading.Event()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -411,35 +410,14 @@ def naturalize_text(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  KOKORO TTS ENGINE — local, free, natural-sounding synthesis
+#  KOKORO TTS ENGINE — streaming synthesis, sentence by sentence
 # ═══════════════════════════════════════════════════════════════════════════════
-def _split_into_sentences(text: str) -> list:
-    """Split text into natural sentence chunks for TTS.
-    
-    Breaking into chunks with slight pauses between them creates
-    natural breathing rhythm — like a person pausing between thoughts.
-    """
-    chunks = _re.split(r"(?<=[.!?])\s+", text)
-    merged = []
-    for chunk in chunks:
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if merged and len(chunk) < 15:
-            merged[-1] += " " + chunk
-        else:
-            merged.append(chunk)
-    return merged if merged else [text]
+_speech_queue : queue.Queue = queue.Queue()   # complete sentences → TTS worker
 
-def _make_silence(duration_ms: int = 180) -> np.ndarray:
-    """Generate a short silence buffer for natural pauses between phrases."""
-    n_samples = int(KOKORO_SAMPLE * duration_ms / 1000)
-    return np.zeros(n_samples, dtype=np.float32)
-
-def _synthesise_chunk(text: str) -> np.ndarray:
-    """Synthesize a single text chunk to numpy audio via Kokoro."""
+def _synthesise_sentence(text: str) -> np.ndarray:
+    """Synthesize a single sentence to numpy audio via Kokoro."""
+    text = naturalize_text(text)
     all_audio = []
-    # KPipeline yields (graphemes, phonemes, audio) tuples
     for _, _, audio in _kokoro_pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_RATE):
         if audio is not None and len(audio) > 0:
             all_audio.append(audio)
@@ -447,84 +425,62 @@ def _synthesise_chunk(text: str) -> np.ndarray:
         return np.array([], dtype=np.float32)
     return np.concatenate(all_audio)
 
-def _synthesise_and_play(text: str):
-    """Natural speech synthesis: chunk → Kokoro → join with silence gaps.
+def _tts_worker_fn():
+    """Background worker: picks sentences from queue, synthesizes, plays immediately.
     
-    Kokoro generates audio locally (no API calls, no cost).
-    Splitting into sentence chunks with silence gaps creates
-    the natural breathing rhythm of human speech.
+    This is the key to low-latency speech. As soon as the first sentence
+    arrives from the streaming response, it gets synthesized and played
+    while the rest of the response is still being generated.
     """
-    text = naturalize_text(text)
-    chunks = _split_into_sentences(text)
-
-    all_audio = []
-    for i, chunk in enumerate(chunks):
-        if _interrupt_event.is_set():
-            return
-
-        try:
-            chunk_audio = _synthesise_chunk(chunk)
-            if len(chunk_audio) > 0:
-                all_audio.append(chunk_audio)
-        except Exception as e:
-            print(f"[TTS] Chunk {i} failed: {e}")
-            continue
-
-        # Add natural pause between sentences
-        if i < len(chunks) - 1:
-            pause_ms = 220 if chunk.rstrip().endswith((".", "!", "?")) else 120
-            all_audio.append(_make_silence(pause_ms))
-
-    if not all_audio:
-        print("[TTS] All chunks failed.")
-        return
-
-    full_audio = np.concatenate(all_audio)
-
-    _interrupt_event.clear()
-    set_state(State.SPEAKING)
-    ui_event("status", "Speaking...")
-
-    sd.play(full_audio, KOKORO_SAMPLE)
-    while sd.get_stream().active:
-        if _interrupt_event.is_set():
-            sd.stop()
-            print("[TTS] Playback interrupted.")
+    while True:
+        text = _speech_queue.get()
+        if text is None:
             break
-        time.sleep(0.02)
+        try:
+            audio = _synthesise_sentence(text)
+            if len(audio) == 0:
+                continue
 
+            _interrupt_event.clear()
+            set_state(State.SPEAKING)
+            ui_event("status", "Speaking...")
+
+            sd.play(audio, KOKORO_SAMPLE)
+            while sd.get_stream().active:
+                if _interrupt_event.is_set():
+                    sd.stop()
+                    break
+                time.sleep(0.02)
+        except Exception as e:
+            print(f"[TTS] Synthesis failed: {e}")
+        finally:
+            _speech_queue.task_done()
+
+    # When queue is done, return to listening
     _interrupt_event.clear()
     set_state(State.LISTENING)
     ui_event("listening")
     ui_event("status", "Listening...")
 
-def tts_thread_fn():
-    while True:
-        text = _tts_queue.get()
-        if text is None:
-            break
-        _synthesise_and_play(text)
-        _tts_queue.task_done()
-
 def speak(text: str):
-    """Non-blocking — queues text for TTS."""
+    """Non-blocking — queues a sentence for TTS."""
     print(f"\n[JARVIS]: {text}")
     ui_event("jarvis", text)
-    _tts_queue.put(text)
+    _speech_queue.put(text)
 
 def speak_and_wait(text: str):
     """Queues text and waits until fully spoken."""
     speak(text)
-    _tts_queue.join()
+    _speech_queue.join()
 
 def interrupt_speech():
     """Stop current speech and clear the queue."""
     _interrupt_event.set()
     sd.stop()
-    while not _tts_queue.empty():
+    while not _speech_queue.empty():
         try:
-            _tts_queue.get_nowait()
-            _tts_queue.task_done()
+            _speech_queue.get_nowait()
+            _speech_queue.task_done()
         except queue.Empty:
             break
 
@@ -780,10 +736,10 @@ LOCAL_SHORTCUTS = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  QUERY PROCESSING
+#  QUERY PROCESSING — streaming: speaks first sentence while rest generates
 # ═══════════════════════════════════════════════════════════════════════════════
 def process_query(query: str):
-    """Called from STT thread. Sends to backend, speaks reply."""
+    """Called from STT thread. Streams from backend, speaks each sentence as it arrives."""
     cleaned = query.strip().lower()
 
     # Exit
@@ -800,28 +756,63 @@ def process_query(query: str):
             ui_event("listening")
             return
 
-    # Backend
+    # Backend — streaming endpoint
     ui_event("thinking")
     ui_event("status", "Thinking...")
     current_time, current_date = get_current_time()
 
     try:
-        r = requests.post(
-            f"{SERVER_URL}/api/jarvis/voice-query",
+        with requests.post(
+            f"{SERVER_URL}/api/jarvis/voice-query-stream",
             json={"prompt": query, "currentTime": current_time, "currentDate": current_date},
-            timeout=45,
-        )
-        if r.status_code == 200:
-            response_text = r.json().get("response", "No response.")
-            cmd, prefix = try_parse_command(response_text)
-            if cmd:
-                if prefix: speak(prefix)
-                ui_event("system_cmd", f"Executing: {cmd.get('command','')}", cmd)
-                speak(handle_command(cmd))
-            else:
-                speak(response_text)
-        else:
-            speak(f"Server error — status {r.status_code}.")
+            stream=True,
+            timeout=60,
+        ) as r:
+            if r.status_code != 200:
+                speak(f"Server error — status {r.status_code}.")
+                set_state(State.LISTENING)
+                ui_event("listening")
+                return
+
+            # Read NDJSON stream — each line is a sentence
+            pending_command = None
+            pending_prefix = None
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if chunk.get("type") == "done":
+                    break
+
+                if chunk.get("type") == "sentence":
+                    text = chunk["text"].strip()
+                    if not text:
+                        continue
+
+                    # Check for system command
+                    cmd, prefix = try_parse_command(text)
+                    if cmd:
+                        pending_command = cmd
+                        pending_prefix = prefix
+                    elif pending_command:
+                        # Command already queued, this is extra text — skip
+                        pass
+                    else:
+                        # Normal speech — queue for immediate synthesis
+                        speak(text)
+
+            # Execute any system command after speech finishes
+            if pending_command:
+                _speech_queue.join()  # wait for prior speech to finish
+                if pending_prefix:
+                    speak(pending_prefix)
+                ui_event("system_cmd", f"Executing: {pending_command.get('command','')}", pending_command)
+                speak(handle_command(pending_command))
+
     except requests.exceptions.ConnectionError:
         speak("Can't reach the server.")
     except requests.exceptions.Timeout:
@@ -830,6 +821,8 @@ def process_query(query: str):
         print(f"[Request Error]: {e}")
         speak("There was a network issue.")
 
+    # Wait for all queued speech to finish before returning to listening
+    _speech_queue.join()
     set_state(State.LISTENING)
     ui_event("listening")
     ui_event("status", "Listening...")
@@ -920,8 +913,8 @@ def main():
     print("      J.A.R.V.I.S.  —  Silero VAD Edition")
     print("=" * 60)
 
-    # TTS thread
-    tts_t = threading.Thread(target=tts_thread_fn, daemon=True, name="TTS")
+    # TTS worker thread (streaming — speaks each sentence as it arrives)
+    tts_t = threading.Thread(target=_tts_worker_fn, daemon=True, name="TTS")
     tts_t.start()
 
     # Mic thread (single stream, runs forever)
@@ -959,7 +952,7 @@ def main():
     except KeyboardInterrupt:
         speak_and_wait("Interrupted. Shutting down.")
 
-    _tts_queue.put(None)
+    _speech_queue.put(None)
     tts_t.join(timeout=2)
 
 

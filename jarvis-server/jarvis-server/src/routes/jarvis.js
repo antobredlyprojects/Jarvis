@@ -1,6 +1,6 @@
 const express = require("express");
 const multer  = require("multer");
-const { queryJarvis, resetConversation } = require("../services/groq");
+const { queryJarvis, queryJarvisStream, resetConversation } = require("../services/groq");
 const { loadMemory, saveMemory }         = require("../services/memory");
 const { synthesise }                     = require("../services/tts");
 const { transcribe }                     = require("../services/whisper");
@@ -29,6 +29,36 @@ router.post("/voice-query", async (req, res) => {
       return res.status(503).json({ response: "The API key hasn't been configured." });
     }
     return res.status(502).json({ response: "I hit a technical snag — give me a moment." });
+  }
+});
+
+// ── POST /api/jarvis/voice-query-stream ─────────────────────────────────────
+// Streams sentences as NDJSON for low-latency TTS
+router.post("/voice-query-stream", async (req, res) => {
+  const { prompt, currentTime, currentDate } = req.body;
+
+  if (!prompt || typeof prompt !== "string" || prompt.trim() === "") {
+    return res.status(400).json({ error: "Missing or invalid 'prompt'." });
+  }
+
+  console.log(`\n[QUERY-STREAM] ${prompt}`);
+
+  res.set({
+    "Content-Type":  "application/x-ndjson",
+    "Cache-Control": "no-cache",
+    "Connection":    "keep-alive",
+  });
+
+  try {
+    for await (const chunk of queryJarvisStream(prompt.trim(), { currentTime, currentDate })) {
+      res.write(JSON.stringify(chunk) + "\n");
+    }
+    res.end();
+  } catch (err) {
+    console.error("[Groq Stream Error]", err.message);
+    res.write(JSON.stringify({ type: "sentence", text: "I hit a technical snag — give me a moment." }) + "\n");
+    res.write(JSON.stringify({ type: "done" }) + "\n");
+    res.end();
   }
 });
 
