@@ -54,8 +54,11 @@ SPEECH_PAD_MS   = 300            # ms of silence after speech before cutting
 MIN_SPEECH_MS   = 400            # ignore segments shorter than this
 MAX_SPEECH_SEC  = 15             # hard cap on a single utterance
 
-# Barge-in disabled during TTS — speaker echo makes it unreliable.
-# To re-enable, uncomment the barge-in logic in mic_thread_fn callback.
+# Barge-in tuning
+SPEAKING_GRACE_MS   = 1500       # ignore mic for first 1.5s after TTS starts (speaker echo)
+BARGE_TRIGGER       = 12         # consecutive speech blocks needed (~384ms) to trigger barge-in
+BARGE_COOLDOWN_MS   = 800        # ignore mic for 800ms after a barge-in (prevents re-trigger)
+SPEAKING_VAD_BOOST  = 0.25       # raise VAD threshold by this much while speaking (harder to trigger)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  KOKORO TTS  — load pipeline once at startup
@@ -117,6 +120,7 @@ _interrupt_event      : threading.Event = threading.Event()
 
 # TTS timing state
 _speaking_started_at  : float   = 0.0    # timestamp when TTS started playing
+_barge_cooldown_until : float   = 0.0    # timestamp until which barge-in is disabled after interrupt
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI BRIDGE  (fire-and-forget, never blocks)
@@ -161,27 +165,68 @@ def mic_thread_fn():
     silence_count    = 0
     speech_buffer    = []   # list of np arrays
 
-    # Barge-in state  (used when SPEAKING)
+    # Barge-in state
     barge_consec     = 0
-    BARGE_TRIGGER    = 4     # consecutive speech blocks to trigger barge-in
+    barge_buffer     = []   # accumulate audio during barge-in for capture
 
     def callback(indata, frames, time_info, status):
         nonlocal in_speech, silence_count, speech_buffer
-        nonlocal barge_consec
+        nonlocal barge_consec, barge_buffer
 
         chunk = indata[:, 0].copy()   # mono
         state = get_state()
         now = time.time()
 
         # ── BARGE-IN (while JARVIS is speaking) ──────────────────────────────
-        # Completely ignore mic during TTS — speaker echo makes barge-in
-        # unreliable on most hardware. User can interrupt by pressing a key
-        # or waiting for JARVIS to finish.
         if state == State.SPEAKING:
-            barge_consec = 0
-            return
+            # Grace period: ignore mic for first N ms after TTS starts
+            elapsed = (now - _speaking_started_at) * 1000
+            if elapsed < SPEAKING_GRACE_MS:
+                barge_consec = 0
+                barge_buffer = []
+                return
+
+            # Cooldown: ignore mic for N ms after a recent barge-in
+            if now < _barge_cooldown_until:
+                barge_consec = 0
+                barge_buffer = []
+                return
+
+            # Run VAD — raise threshold while speaking (harder to trigger)
+            conf = vad_is_speech(chunk)
+            effective_threshold = VAD_THRESHOLD + SPEAKING_VAD_BOOST
+
+            if conf >= effective_threshold:
+                barge_consec += 1
+                barge_buffer.append(chunk)  # capture the interrupting audio
+                if barge_consec >= BARGE_TRIGGER:
+                    print("[Barge-in] User interrupted JARVIS.")
+                    _interrupt_event.set()
+                    # Drain the speech queue so JARVIS stops talking
+                    while not _speech_queue.empty():
+                        try:
+                            _speech_queue.get_nowait()
+                            _speech_queue.task_done()
+                        except queue.Empty:
+                            break
+                    # Capture the interrupting utterance for STT
+                    if barge_buffer:
+                        audio = np.concatenate(barge_buffer)
+                        if len(audio) >= min_blocks:
+                            _speech_segment_queue.put(audio)
+                    barge_consec = 0
+                    barge_buffer = []
+                    _barge_cooldown_until = time.time() + (BARGE_COOLDOWN_MS / 1000)
+                    # Transition to LISTENING so STT picks up the captured audio
+                    set_state(State.LISTENING)
+                    ui_event("listening")
+            else:
+                barge_consec = max(0, barge_consec - 1)
+                barge_buffer.append(chunk)
+            return   # don't accumulate normal speech while JARVIS talks
 
         barge_consec = 0   # reset when not speaking
+        barge_buffer = []
 
         # ── DISCARD while PROCESSING ─────────────────────────────────────────
         if state == State.PROCESSING:
@@ -449,7 +494,21 @@ def _tts_worker_fn():
     """
     global _speaking_started_at
     while True:
-        text = _speech_queue.get()
+        # Use timeout so barge-in can unblock us when queue is drained.
+        # Without timeout, _speech_queue.get() blocks forever after barge-in
+        # drains the queue, leaving the worker stuck.
+        try:
+            text = _speech_queue.get(timeout=0.3)
+        except queue.Empty:
+            # Queue empty — check if we were interrupted (barge-in drained it)
+            if _interrupt_event.is_set():
+                _interrupt_event.clear()
+                set_state(State.LISTENING)
+                ui_event("listening")
+                ui_event("status", "Listening...")
+                continue  # go back to waiting for new speech
+            continue  # no interrupt, just no new sentences yet
+
         if text is None:
             break
         try:
@@ -1136,6 +1195,37 @@ def handle_commands(cmds: list) -> str:
             time.sleep(0.5)
     return "; ".join(results)
 
+
+def _extract_json_objects(s: str) -> list:
+    """Extract all balanced JSON objects from a string, using brace matching.
+    
+    This is robust against any whitespace variation from the LLM.
+    Returns list of parsed dicts.
+    """
+    results = []
+    i = 0
+    while i < len(s):
+        if s[i] == '{':
+            depth = 0
+            start = i
+            for j in range(i, len(s)):
+                if s[j] == '{': depth += 1
+                elif s[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            obj = json.loads(s[start:j+1])
+                            results.append(obj)
+                        except json.JSONDecodeError:
+                            pass
+                        i = j + 1
+                        break
+            else:
+                break  # unmatched brace
+        else:
+            i += 1
+    return results
+
 def try_parse_commands(response: str) -> tuple:
     """Extract system commands from LLM response.
     
@@ -1143,61 +1233,59 @@ def try_parse_commands(response: str) -> tuple:
     1. Single: {"action":"SYSTEM_COMMAND", "command":"...", "params":{}}
     2. Multi:  [{"action":"SYSTEM_COMMAND", ...}, {"action":"SYSTEM_COMMAND", ...}]
     
+    Uses brace-matching instead of exact string search, so it handles
+    any whitespace/indentation the LLM or JSON.stringify produces.
+    
     Returns (commands_list, prefix_text).
     commands_list is empty if no commands found.
     """
     s = response.strip()
     
-    # Try to find a JSON array of commands first
-    arr_start = s.find('[{"action":"SYSTEM_COMMAND"')
-    if arr_start == -1:
-        arr_start = s.find('[{"action": "SYSTEM_COMMAND"')
+    # Extract all JSON objects from the response
+    objects = _extract_json_objects(s)
     
-    if arr_start != -1:
-        # Find matching closing bracket
-        depth = 0
-        arr_end = -1
-        for i, ch in enumerate(s[arr_start:], arr_start):
-            if ch == "[": depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0: arr_end = i; break
-        if arr_end != -1:
-            try:
-                cmds = json.loads(s[arr_start:arr_end + 1])
-                if isinstance(cmds, list):
-                    prefix = s[:arr_start].strip()
-                    # Filter valid commands
-                    valid = [c for c in cmds if c.get("action") == "SYSTEM_COMMAND"]
-                    if valid:
-                        return valid, prefix or None
-            except json.JSONDecodeError:
-                pass
+    # Filter for SYSTEM_COMMAND objects
+    valid = [o for o in objects if o.get("action") == "SYSTEM_COMMAND"]
     
-    # Fall back to single command
-    cmd, prefix = try_parse_command_single(s)
-    if cmd:
-        return [cmd], prefix
-    return [], None
+    if not valid:
+        return [], None
+    
+    # Find where the first command starts in the original text
+    # by scanning for the first '{' that parses to a SYSTEM_COMMAND
+    first_cmd_start = -1
+    i = 0
+    while i < len(s):
+        if s[i] == '{':
+            depth = 0
+            start = i
+            for j in range(i, len(s)):
+                if s[j] == '{': depth += 1
+                elif s[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            obj = json.loads(s[start:j+1])
+                            if obj.get("action") == "SYSTEM_COMMAND":
+                                first_cmd_start = start
+                        except json.JSONDecodeError:
+                            pass
+                        break
+            if first_cmd_start != -1:
+                break
+        i += 1
+    
+    prefix = None
+    if first_cmd_start > 0:
+        prefix_text = s[:first_cmd_start].strip()
+        if prefix_text:
+            prefix = prefix_text
+    
+    return valid, prefix
 
 def try_parse_command_single(response: str):
     """Parse a single SYSTEM_COMMAND from response text."""
-    s = response.strip()
-    start = s.find('{"action":"SYSTEM_COMMAND"')
-    if start == -1:
-        start = s.find('{"action": "SYSTEM_COMMAND"')
-    if start == -1: return None, None
-    try:
-        depth = end = 0
-        for i, ch in enumerate(s[start:], start):
-            if ch == "{": depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0: end = i; break
-        cmd    = json.loads(s[start:end+1])
-        prefix = s[:start].strip()
-        return cmd, prefix or None
-    except: return None, None
+    cmds, prefix = try_parse_commands(response)
+    return cmds[0] if cmds else None, prefix
 
 def try_parse_command(response: str):
     """Backward-compatible: returns single command or None."""
