@@ -1,0 +1,66 @@
+{
+    "whatsapp": {
+        "name": "WhatsApp",
+        "appid": "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
+    },
+    "visual studio": {
+        "name": "Visual Studio Code",
+        "appid": "Microsoft.VisualStudioCode"
+    },
+    "edge": {
+        "name": "Microsoft Edge",
+        "appid": "MSEdge"
+    },
+    "settingw": {
+        "name": "Settings",
+        "appid": "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+    },
+    "store": {
+        "name": "Microsoft Store",
+        "appid": "Microsoft.WindowsStore_8wekyb3d8bbwe!App"
+    },
+    "calculator": {
+        "name": "Calculator",
+        "appid": "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+    },
+    "chatgpt": {
+        "name": "ChatGPT",
+        "appid": "OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!ChatGPT"
+    },
+    "claude": {
+        "name": "Claude",
+        "appid": "Claude_pzs8sxrjxfjjc!Claude"
+    },
+    "roblox": {
+        "name": "Roblox Player",
+        "appid": "C:\\Users\\antob\\AppData\\Local\\Roblox\\Versions\\version-e818b735b71e494d\\RobloxPlayerBeta.exe"
+    },
+    "file": {
+        "name": "File Explorer",
+        "appid": "Microsoft.Windows.Explorer"
+    },
+    "notepad": {
+        "name": "Notepad",
+        "appid": "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"
+    },
+    "launcher": {
+        "name": "LiquidLauncher",
+        "appid": "net.ccbluex.liquidlauncher"
+    },
+    "command": {
+        "name": "Command Prompt",
+        "appid": "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\cmd.exe"
+    },
+    "word": {
+        "name": "Word",
+        "appid": "Microsoft.Office.WINWORD.EXE.15"
+    },
+    "powerpoint": {
+        "name": "PowerPoint",
+        "appid": "Microsoft.Office.POWERPNT.EXE.15"
+    },
+    "paint": {
+        "name": "Paint",
+        "appid": "Microsoft.Paint_8wekyb3d8bbwe!App"
+    }
+}
