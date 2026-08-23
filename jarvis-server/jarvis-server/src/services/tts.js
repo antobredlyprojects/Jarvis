@@ -4,8 +4,8 @@ const path = require("path");
 const os   = require("os");
 
 const TTS_VOICE = process.env.TTS_VOICE || "en-GB-RyanNeural";
-const TTS_RATE  = process.env.TTS_RATE  || "-10%";
-const TTS_PITCH = process.env.TTS_PITCH || "-5Hz";
+const TTS_RATE  = process.env.TTS_RATE  || "-5%";   // calm, composed
+const TTS_PITCH = process.env.TTS_PITCH || "-3Hz";   // authoritative without booming
 
 /**
  * Synthesise speech using the edge-tts Python CLI.

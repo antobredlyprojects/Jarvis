@@ -43,8 +43,8 @@ except: HAS_MSS = False
 # ═══════════════════════════════════════════════════════════════════════════════
 SERVER_URL      = "http://localhost:3000"
 TTS_VOICE       = "en-GB-RyanNeural"
-TTS_RATE        = "-10%"
-TTS_PITCH       = "-5Hz"
+TTS_RATE        = "-5%"           # slightly below normal — calm, composed
+TTS_PITCH       = "-3Hz"           # slightly deeper — authoritative without booming
 
 SAMPLE_RATE     = 16000          # Silero VAD requires 16kHz
 BLOCK_SIZE      = 512            # ~32ms per block at 16kHz
@@ -267,28 +267,235 @@ def stt_thread_fn():
         _speech_segment_queue.task_done()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TTS THREAD  — dedicated event loop, never blocks main
+#  TEXT NATURALIZER — makes TTS output sound human, not robotic
+# ═══════════════════════════════════════════════════════════════════════════════
+import re as _re
+
+# Numbers 0-1000 → words for natural pronunciation
+_ONES = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+         "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+         "seventeen", "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+def _num_to_words(n: int) -> str:
+    """Convert 0-999 to words."""
+    if n < 20: return _ONES[n]
+    if n < 100:
+        rest = _ONES[n % 10]
+        return _TENS[n // 10] + ("-" + rest if rest else "")
+    h = _ONES[n // 100] + " hundred"
+    rest = n % 100
+    return h + (" and " + _num_to_words(rest) if rest else "")
+
+# Abbreviations that sound weird when read literally
+_ABBREVS = {
+    "Dr.": "Doctor",
+    "Mr.": "Mister",
+    "Mrs.": "Missus",
+    "Ms.": "Miss",
+    "St.": "Saint",
+    "vs.": "versus",
+    "vs": "versus",
+    "etc.": "etcetera",
+    "i.e.": "that is",
+    "e.g.": "for example",
+    "a.m.": "a m",
+    "p.m.": "p m",
+    "AM": "a m",
+    "PM": "p m",
+}
+
+# Symbols that sound weird spoken literally
+_SYMBOLS = {
+    "&": "and",
+    "%": "percent",
+    "@": "at",
+    "+": "plus",
+    "=": "equals",
+    "#": "hash",
+    "~": "tilde",
+    "\\": "",
+}
+
+def naturalize_text(text: str) -> str:
+    """Transform text so edge-tts sounds human, not robotic.
+    
+    What this does:
+    - Expands numbers to words ("42" → "forty two")
+    - Normalizes abbreviations ("Dr." → "Doctor")
+    - Cleans URLs and emails into speakable form
+    - Replaces symbols with words
+    - Adds natural rhythm markers
+    - Removes markdown/formatting artifacts
+    """
+    if not text:
+        return text
+
+    t = text
+
+    # 1. Remove markdown/formatting artifacts
+    t = t.replace("**", "").replace("*", "")
+    t = t.replace("`", "")
+    t = t.replace("#", "")
+    t = t.replace("---", "")
+    t = t.replace("---", "")
+    t = _re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)  # [text](url) → text
+
+    # 2. Normalize URLs → "the website example dot com"
+    def _clean_url(m):
+        url = m.group(0)
+        # Strip protocol
+        url = _re.sub(r"^https?://", "", url)
+        # Strip trailing slashes/path
+        url = url.split("/")[0]
+        # Split by dots and join naturally
+        parts = url.split(".")
+        # Remove www
+        parts = [p for p in parts if p.lower() not in ("www", "com", "org", "net", "io")]
+        return " ".join(parts) + " dot com" if parts else url
+    t = _re.sub(r"https?://[^\s]+", _clean_url, t)
+
+    # 3. Normalize emails → "user at domain dot com"
+    def _clean_email(m):
+        user, domain = m.group(1), m.group(2)
+        domain = domain.replace(".", " dot ")
+        return f"{user} at {domain}"
+    t = _re.sub(r"([\w.+-]+)@([\w.-]+)", _clean_email, t)
+
+    # 4. Expand abbreviations
+    for abbr, expanded in _ABBREVS.items():
+        t = t.replace(abbr, expanded)
+
+    # 5. Replace symbols
+    for sym, word in _SYMBOLS.items():
+        t = t.replace(sym, " " + word + " " if word else " ")
+
+    # 6. Convert numbers to words (standalone numbers and ordinals)
+    def _replace_num(m):
+        num_str = m.group(0)
+        # Handle ordinals: 1st, 2nd, 3rd, 4th...
+        if m.group(1).lower() in ("st", "nd", "rd", "th"):
+            base = int(num_str[:-2])
+            return _num_to_words(base) + " " + m.group(1).lower()
+        n = int(num_str)
+        if 0 <= n <= 999:
+            return _num_to_words(n)
+        return num_str  # too large, leave as-is
+    t = _re.sub(r"(\d+)(st|nd|rd|th)\b", _replace_num, t, flags=_re.IGNORECASE)
+    t = _re.sub(r"\b(\d{1,3})\b", _replace_num, t)
+
+    # 7. Normalize time references: "3:00 PM" → "three p m"
+    def _clean_time(m):
+        hour, minute, ampm = m.group(1), m.group(2), m.group(3)
+        h = _num_to_words(int(hour))
+        if minute and int(minute) > 0:
+            return f"{h} {_num_to_words(int(minute))}"
+        return h + " o'clock"
+    t = _re.sub(r"(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)\b", _clean_time, t)
+
+    # 8. Collapse multiple spaces and trim
+    t = _re.sub(r"\s+", " ", t).strip()
+
+    # 9. Ensure sentences end with proper punctuation for natural pauses
+    t = _re.sub(r"([.!?])([A-Z])", r"\1 \2", t)  # ensure space after sentence end
+
+    return t
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  NATURAL SPEECH ENGINE — chunked synthesis with human rhythm
 # ═══════════════════════════════════════════════════════════════════════════════
 _tts_loop: asyncio.AbstractEventLoop = None
+def _split_into_sentences(text: str) -> list:
+    """Split text into natural sentence chunks for TTS.
+    
+    Edge-TTS can sound flat on long sentences. Breaking into chunks
+    with slight pauses between them creates natural breathing rhythm.
+    """
+    # Split on sentence boundaries, keeping the punctuation
+    chunks = _re.split(r"(?<=[.!?])\s+", text)
+    # Merge very short chunks (< 15 chars) with previous
+    merged = []
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if merged and len(chunk) < 15:
+            merged[-1] += " " + chunk
+        else:
+            merged.append(chunk)
+    return merged if merged else [text]
 
-async def _synthesise_and_play(text: str):
+def _make_silence(duration_ms: int = 180, sr: int = None) -> np.ndarray:
+    """Generate a short silence buffer for natural pauses between phrases."""
+    if sr is None:
+        sr = SAMPLE_RATE
+    n_samples = int(sr * duration_ms / 1000)
+    return np.zeros(n_samples, dtype=np.float32)
+
+async def _synthesise_chunk(text: str) -> tuple:
+    """Synthesize a single text chunk to numpy audio + sample rate."""
     tmp = os.path.join(tempfile.gettempdir(), f"jarvis_{uuid.uuid4().hex}.mp3")
     try:
         comm = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
         await comm.save(tmp)
-        audio_data, sr_rate = sf.read(tmp, dtype="float32")
-    except Exception as e:
-        print(f"[TTS Synth Error]: {e}")
-        return
+        audio_data, sr = sf.read(tmp, dtype="float32")
+        return audio_data, sr
     finally:
         try: os.remove(tmp)
         except OSError: pass
+
+async def _synthesise_and_play(text: str):
+    """Natural speech synthesis: chunk → synthesize → join with silence gaps.
+    
+    The key insight: human speech has natural pauses between sentences.
+    A single long TTS pass sounds flat and robotic. By splitting into
+    chunks, synthesizing each, and joining with silence gaps,
+    the result sounds like a person actually breathing between thoughts.
+    """
+    # Naturalize the text first
+    text = naturalize_text(text)
+
+    # Split into sentence chunks
+    chunks = _split_into_sentences(text)
+
+    # Synthesize each chunk and concatenate with silence gaps
+    all_audio = []
+    detected_sr = None
+    for i, chunk in enumerate(chunks):
+        if _interrupt_event.is_set():
+            return  # stop immediately if interrupted
+
+        try:
+            chunk_audio, sr = await _synthesise_chunk(chunk)
+            all_audio.append(chunk_audio)
+            if detected_sr is None:
+                detected_sr = sr
+        except Exception as e:
+            print(f"[TTS] Chunk {i} failed: {e}")
+            continue
+
+        # Add a natural pause between sentences (not after the last)
+        if i < len(chunks) - 1:
+            # Longer pause after periods, shorter after commas
+            pause_ms = 220 if chunk.rstrip().endswith((".", "!", "?")) else 120
+            all_audio.append(_make_silence(pause_ms, detected_sr or SAMPLE_RATE))
+
+    if not all_audio:
+        print("[TTS] All chunks failed.")
+        return
+
+    if detected_sr is None:
+        detected_sr = SAMPLE_RATE
+
+    # Concatenate all chunks + silence into one audio stream
+    full_audio = np.concatenate(all_audio)
 
     _interrupt_event.clear()
     set_state(State.SPEAKING)
     ui_event("status", "Speaking...")
 
-    sd.play(audio_data, sr_rate)
+    sd.play(full_audio, detected_sr)
     # Poll for interrupt instead of blocking with sd.wait()
     while sd.get_stream().active:
         if _interrupt_event.is_set():
