@@ -673,44 +673,491 @@ def cmd_search_files(p):
         result += f" (and {len(matches) - 10} more)"
     return result
 
+# ── Window Management Commands ─────────────────────────────────────────────
+def _find_windows_by_name(name: str) -> list:
+    """Find window handles matching an app name using PowerShell/.NET."""
+    if not HAS_PSUTIL:
+        return []
+    # Find the process ID(s) by name
+    pids = []
+    name_lower = name.lower()
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if name_lower in (proc.info["name"] or "").lower():
+                pids.append(proc.info["pid"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if not pids:
+        return []
+    # Use PowerShell to find windows belonging to those PIDs
+    pid_list = ",".join(str(p) for p in pids)
+    script = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WinAPI {{
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+}}
+"@
+$pids = @({pid_list})
+$results = @()
+$callback = [WinAPI+EnumWindowsProc]{{
+    param($hWnd, $lParam)
+    if ([WinAPI]::IsWindowVisible($hWnd)) {{
+        $pid = 0
+        [WinAPI]::GetWindowThreadProcessId($hWnd, [ref]$pid) | Out-Null
+        if ($pids -contains $pid) {{
+            $sb = New-Object System.Text.StringBuilder 256
+            [WinAPI]::GetWindowText($hWnd, $sb, 256) | Out-Null
+            $title = $sb.ToString()
+            if ($title) {{ $results += $title }}
+        }}
+    }}
+    return $true
+}}
+[WinAPI]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+$results | ConvertTo-Json -Compress
+"""
+    out = _ps(script)
+    if not out or out == "[]":
+        return []
+    try:
+        data = json.loads(out)
+        if isinstance(data, str): data = [data]
+        return data
+    except:
+        return []
+
+def cmd_close_app(p):
+    """Close an application by name."""
+    name = p.get("app", "")
+    if not name:
+        return "Which app should I close?"
+    if not HAS_PSUTIL:
+        return "psutil not installed."
+    killed = 0
+    name_lower = name.lower()
+    for proc in psutil.process_iter(["name", "pid"]):
+        try:
+            if name_lower in (proc.info["name"] or "").lower():
+                proc.terminate()
+                killed += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if killed:
+        return f"Closed {name}."
+    return f"No running process found for {name}."
+
+def cmd_minimize_app(p):
+    """Minimize an application window."""
+    name = p.get("app", "")
+    if not name:
+        return "Which app should I minimize?"
+    script = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinAPI {{
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+}}
+"@
+$target = "{name.lower()}"
+$pids = @()
+Get-Process | Where-Object {{ $_.ProcessName -like "*$target*" }} | ForEach-Object {{ $pids += $_.Id }}
+if ($pids.Count -eq 0) {{ Write-Output "NOT_FOUND"; exit }}
+$found = $false
+$callback = [WinAPI+EnumWindowsProc]{{
+    param($hWnd, $lParam)
+    if ([WinAPI]::IsWindowVisible($hWnd)) {{
+        $pid = 0
+        [WinAPI]::GetWindowThreadProcessId($hWnd, [ref]$pid) | Out-Null
+        if ($pids -contains $pid) {{
+            [WinAPI]::ShowWindow($hWnd, 6) | Out-Null  # SW_MINIMIZE = 6
+            $found = $true
+        }}
+    }}
+    return $true
+}}
+[WinAPI]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+if ($found) {{ Write-Output "OK" }} else {{ Write-Output "NOT_FOUND" }}
+"""
+    result = _ps(script)
+    if result == "OK":
+        return f"Minimized {name}."
+    return f"Couldn't find a window for {name}."
+
+def cmd_maximize_app(p):
+    """Maximize an application window."""
+    name = p.get("app", "")
+    if not name:
+        return "Which app should I maximize?"
+    script = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinAPI {{
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+}}
+"@
+$target = "{name.lower()}"
+$pids = @()
+Get-Process | Where-Object {{ $_.ProcessName -like "*$target*" }} | ForEach-Object {{ $pids += $_.Id }}
+if ($pids.Count -eq 0) {{ Write-Output "NOT_FOUND"; exit }}
+$found = $false
+$callback = [WinAPI+EnumWindowsProc]{{
+    param($hWnd, $lParam)
+    if ([WinAPI]::IsWindowVisible($hWnd)) {{
+        $pid = 0
+        [WinAPI]::GetWindowThreadProcessId($hWnd, [ref]$pid) | Out-Null
+        if ($pids -contains $pid) {{
+            [WinAPI]::ShowWindow($hWnd, 3) | Out-Null  # SW_MAXIMIZE = 3
+            $found = $true
+        }}
+    }}
+    return $true
+}}
+[WinAPI]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+if ($found) {{ Write-Output "OK" }} else {{ Write-Output "NOT_FOUND" }}
+"""
+    result = _ps(script)
+    if result == "OK":
+        return f"Maximized {name}."
+    return f"Couldn't find a window for {name}."
+
+def cmd_focus_app(p):
+    """Bring an application window to the front."""
+    name = p.get("app", "")
+    if not name:
+        return "Which app should I focus?"
+    # Try the existing launcher's bring-to-front first
+    try:
+        from app_launcher import resolve
+        app = resolve(name)
+        if app and app.get("executable"):
+            from app_launcher import _bring_to_front
+            if _bring_to_front(app["executable"]):
+                return f"Brought {app['name']} to the front."
+    except Exception:
+        pass
+    # Fallback: PowerShell approach
+    script = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinAPI {{
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+}}
+"@
+$target = "{name.lower()}"
+$pids = @()
+Get-Process | Where-Object {{ $_.ProcessName -like "*$target*" }} | ForEach-Object {{ $pids += $_.Id }}
+if ($pids.Count -eq 0) {{ Write-Output "NOT_FOUND"; exit }}
+$found = $false
+$callback = [WinAPI+EnumWindowsProc]{{
+    param($hWnd, $lParam)
+    if ([WinAPI]::IsWindowVisible($hWnd)) {{
+        $pid = 0
+        [WinAPI]::GetWindowThreadProcessId($hWnd, [ref]$pid) | Out-Null
+        if ($pids -contains $pid) {{
+            [WinAPI]::SetForegroundWindow($hWnd) | Out-Null
+            $found = $true
+        }}
+    }}
+    return $true
+}}
+[WinAPI]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+if ($found) {{ Write-Output "OK" }} else {{ Write-Output "NOT_FOUND" }}
+"""
+    result = _ps(script)
+    if result == "OK":
+        return f"Brought {name} to the front."
+    return f"Couldn't find a window for {name}."
+
+def cmd_restore_app(p):
+    """Restore a minimized application window."""
+    name = p.get("app", "")
+    if not name:
+        return "Which app should I restore?"
+    script = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinAPI {{
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+}}
+"@
+$target = "{name.lower()}"
+$pids = @()
+Get-Process | Where-Object {{ $_.ProcessName -like "*$target*" }} | ForEach-Object {{ $pids += $_.Id }}
+if ($pids.Count -eq 0) {{ Write-Output "NOT_FOUND"; exit }}
+$found = $false
+$callback = [WinAPI+EnumWindowsProc]{{
+    param($hWnd, $lParam)
+    if ([WinAPI]::IsWindowVisible($hWnd)) {{
+        $pid = 0
+        [WinAPI]::GetWindowThreadProcessId($hWnd, [ref]$pid) | Out-Null
+        if ($pids -contains $pid) {{
+            [WinAPI]::ShowWindow($hWnd, 9) | Out-Null  # SW_RESTORE = 9
+            [WinAPI]::SetForegroundWindow($hWnd) | Out-Null
+            $found = $true
+        }}
+    }}
+    return $true
+}}
+[WinAPI]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+if ($found) {{ Write-Output "OK" }} else {{ Write-Output "NOT_FOUND" }}
+"""
+    result = _ps(script)
+    if result == "OK":
+        return f"Restored {name}."
+    return f"Couldn't find a window for {name}."
+
+def cmd_resize_window(p):
+    """Resize an application window."""
+    name = p.get("app", "")
+    width = p.get("width", 800)
+    height = p.get("height", 600)
+    if not name:
+        return "Which app should I resize?"
+    script = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinAPI {{
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int x, int y, int w, int h, bool repaint);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+}}
+"@
+$target = "{name.lower()}"
+$pids = @()
+Get-Process | Where-Object {{ $_.ProcessName -like "*$target*" }} | ForEach-Object {{ $pids += $_.Id }}
+if ($pids.Count -eq 0) {{ Write-Output "NOT_FOUND"; exit }}
+$callback = [WinAPI+EnumWindowsProc]{{
+    param($hWnd, $lParam)
+    if ([WinAPI]::IsWindowVisible($hWnd)) {{
+        $pid = 0
+        [WinAPI]::GetWindowThreadProcessId($hWnd, [ref]$pid) | Out-Null
+        if ($pids -contains $pid) {{
+            [WinAPI]::MoveWindow($hWnd, 100, 100, {int(width)}, {int(height)}, $true) | Out-Null
+            Write-Output "OK"
+            return $false
+        }}
+    }}
+    return $true
+}}
+[WinAPI]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+"""
+    result = _ps(script)
+    if "OK" in result:
+        return f"Resized {name} to {width} by {height}."
+    return f"Couldn't find a window for {name}."
+
+def cmd_move_window(p):
+    """Move an application window to a position."""
+    name = p.get("app", "")
+    x = p.get("x", 100)
+    y = p.get("y", 100)
+    if not name:
+        return "Which app should I move?"
+    script = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinAPI {{
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int x, int y, int w, int h, bool repaint);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT {{ public int Left, Top, Right, Bottom; }}
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+}}
+"@
+$target = "{name.lower()}"
+$pids = @()
+Get-Process | Where-Object {{ $_.ProcessName -like "*$target*" }} | ForEach-Object {{ $pids += $_.Id }}
+if ($pids.Count -eq 0) {{ Write-Output "NOT_FOUND"; exit }}
+$callback = [WinAPI+EnumWindowsProc]{{
+    param($hWnd, $lParam)
+    if ([WinAPI]::IsWindowVisible($hWnd)) {{
+        $pid = 0
+        [WinAPI]::GetWindowThreadProcessId($hWnd, [ref]$pid) | Out-Null
+        if ($pids -contains $pid) {{
+            $rect = New-Object WinAPI+RECT
+            [WinAPI]::GetWindowRect($hWnd, [ref]$rect) | Out-Null
+            $w = $rect.Right - $rect.Left
+            $h = $rect.Bottom - $rect.Top
+            [WinAPI]::MoveWindow($hWnd, {int(x)}, {int(y)}, $w, $h, $true) | Out-Null
+            Write-Output "OK"
+            return $false
+        }}
+    }}
+    return $true
+}}
+[WinAPI]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+"""
+    result = _ps(script)
+    if "OK" in result:
+        return f"Moved {name} to position {x}, {y}."
+    return f"Couldn't find a window for {name}."
+
+def cmd_fullscreen_app(p):
+    """Toggle fullscreen for an application using F11."""
+    name = p.get("app", "")
+    if name:
+        # Focus the app first, then send F11
+        focus_result = cmd_focus_app({"app": name})
+        if "Couldn't" in focus_result:
+            return focus_result
+        time.sleep(0.3)
+    if HAS_PYAUTOGUI:
+        pyautogui.press("f11")
+        return f"Toggled fullscreen{' for ' + name if name else ''}."
+    return "pyautogui not installed."
+
 COMMANDS = {
+    # App lifecycle
     "open_app":        cmd_open_app,
+    "close_app":       cmd_close_app,
+    "focus_app":       cmd_focus_app,
+    "minimize_app":    cmd_minimize_app,
+    "maximize_app":    cmd_maximize_app,
+    "restore_app":     cmd_restore_app,
+    "fullscreen_app":  cmd_fullscreen_app,
+    "resize_window":   cmd_resize_window,
+    "move_window":     cmd_move_window,
+    # Volume & audio
     "set_volume":      cmd_set_volume,
     "mute":            cmd_mute,
-    "shutdown":        cmd_shutdown,
-    "restart":         cmd_restart,
-    "lock":            cmd_lock,
-    "screenshot":      cmd_screenshot,
+    # Mouse & keyboard
     "mouse_click":     cmd_mouse_click,
     "mouse_move":      cmd_mouse_move,
     "type_text":       cmd_type_text,
     "hotkey":          cmd_hotkey,
+    # Browser & web
     "open_url":        cmd_open_url,
     "search_web":      cmd_search_web,
+    # Clipboard
     "clipboard_read":  cmd_clipboard_read,
     "clipboard_write": cmd_clipboard_write,
+    # Processes
     "list_processes":  cmd_list_processes,
     "kill_process":    cmd_kill_process,
+    # System
     "system_info":     cmd_system_info,
-    "toast":           cmd_toast,
+    "screenshot":      cmd_screenshot,
+    "lock":            cmd_lock,
+    "shutdown":        cmd_shutdown,
+    "restart":         cmd_restart,
     "cancel_shutdown": cmd_cancel_shutdown,
+    "toast":           cmd_toast,
+    # Files
+    "create_file":     cmd_create_file,
+    "search_files":    cmd_search_files,
+    # Aliases
     "add_alias":       cmd_add_alias,
     "remove_alias":    cmd_remove_alias,
     "refresh_apps":    cmd_refresh_apps,
-    "create_file":     cmd_create_file,
-    "search_files":    cmd_search_files,
 }
 
 def handle_command(cmd: dict) -> str:
+    """Execute a single system command. Returns the spoken result."""
     fn = COMMANDS.get(cmd.get("command",""))
     if fn:
         try:    return fn(cmd.get("params", {}))
         except Exception as e: return f"Command error: {e}"
     return f"Unknown command: {cmd.get('command')}."
 
-def try_parse_command(response: str):
+def handle_commands(cmds: list) -> str:
+    """Execute multiple commands sequentially with short delays between them.
+    Returns a combined spoken summary.
+    """
+    results = []
+    for i, cmd in enumerate(cmds):
+        if _interrupt_event.is_set():
+            results.append("Interrupted.")
+            break
+        result = handle_command(cmd)
+        results.append(result)
+        # Small delay between commands (except after the last one)
+        if i < len(cmds) - 1:
+            time.sleep(0.5)
+    return "; ".join(results)
+
+def try_parse_commands(response: str) -> tuple:
+    """Extract system commands from LLM response.
+    
+    Supports two formats:
+    1. Single: {"action":"SYSTEM_COMMAND", "command":"...", "params":{}}
+    2. Multi:  [{"action":"SYSTEM_COMMAND", ...}, {"action":"SYSTEM_COMMAND", ...}]
+    
+    Returns (commands_list, prefix_text).
+    commands_list is empty if no commands found.
+    """
+    s = response.strip()
+    
+    # Try to find a JSON array of commands first
+    arr_start = s.find('[{"action":"SYSTEM_COMMAND"')
+    if arr_start == -1:
+        arr_start = s.find('[{"action": "SYSTEM_COMMAND"')
+    
+    if arr_start != -1:
+        # Find matching closing bracket
+        depth = 0
+        arr_end = -1
+        for i, ch in enumerate(s[arr_start:], arr_start):
+            if ch == "[": depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0: arr_end = i; break
+        if arr_end != -1:
+            try:
+                cmds = json.loads(s[arr_start:arr_end + 1])
+                if isinstance(cmds, list):
+                    prefix = s[:arr_start].strip()
+                    # Filter valid commands
+                    valid = [c for c in cmds if c.get("action") == "SYSTEM_COMMAND"]
+                    if valid:
+                        return valid, prefix or None
+            except json.JSONDecodeError:
+                pass
+    
+    # Fall back to single command
+    cmd, prefix = try_parse_command_single(s)
+    if cmd:
+        return [cmd], prefix
+    return [], None
+
+def try_parse_command_single(response: str):
+    """Parse a single SYSTEM_COMMAND from response text."""
     s = response.strip()
     start = s.find('{"action":"SYSTEM_COMMAND"')
+    if start == -1:
+        start = s.find('{"action": "SYSTEM_COMMAND"')
     if start == -1: return None, None
     try:
         depth = end = 0
@@ -723,6 +1170,11 @@ def try_parse_command(response: str):
         prefix = s[:start].strip()
         return cmd, prefix or None
     except: return None, None
+
+def try_parse_command(response: str):
+    """Backward-compatible: returns single command or None."""
+    cmds, prefix = try_parse_commands(response)
+    return cmds[0] if cmds else None, prefix
 
 LOCAL_SHORTCUTS = {
     "cancel shutdown":      lambda: cmd_cancel_shutdown({}),
@@ -775,7 +1227,7 @@ def process_query(query: str):
                 return
 
             # Read NDJSON stream — each line is a sentence
-            pending_command = None
+            pending_commands = []
             pending_prefix = None
             for line in r.iter_lines(decode_unicode=True):
                 if not line:
@@ -793,25 +1245,27 @@ def process_query(query: str):
                     if not text:
                         continue
 
-                    # Check for system command
-                    cmd, prefix = try_parse_command(text)
-                    if cmd:
-                        pending_command = cmd
-                        pending_prefix = prefix
-                    elif pending_command:
-                        # Command already queued, this is extra text — skip
+                    # Check for system commands (single or multi)
+                    cmds, prefix = try_parse_commands(text)
+                    if cmds:
+                        pending_commands.extend(cmds)
+                        if prefix and not pending_prefix:
+                            pending_prefix = prefix
+                    elif pending_commands:
+                        # Commands already queued, this is extra text — skip
                         pass
                     else:
                         # Normal speech — queue for immediate synthesis
                         speak(text)
 
-            # Execute any system command after speech finishes
-            if pending_command:
+            # Execute any system commands after speech finishes
+            if pending_commands:
                 _speech_queue.join()  # wait for prior speech to finish
                 if pending_prefix:
                     speak(pending_prefix)
-                ui_event("system_cmd", f"Executing: {pending_command.get('command','')}", pending_command)
-                speak(handle_command(pending_command))
+                for cmd in pending_commands:
+                    ui_event("system_cmd", f"Executing: {cmd.get('command','')}", cmd)
+                speak(handle_commands(pending_commands))
 
     except requests.exceptions.ConnectionError:
         speak("Can't reach the server.")

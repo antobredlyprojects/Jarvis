@@ -463,20 +463,35 @@ async function sendTyped() {
     document.getElementById('resp-time').textContent = ms + 'ms';
     typingEl.classList.remove('show');
     const resp = data.response || 'No response.';
-    // Parse system commands from LLM response
-    const cmdMatch = resp.match(/\{"action":"SYSTEM_COMMAND"[\s\S]*?\}/);
-    if (cmdMatch) {
+    // Parse system commands (single or multi-step array)
+    let handled = false;
+    // Try array first: [{"action":"SYSTEM_COMMAND",...}, ...]
+    const arrMatch = resp.match(/\[\s*\{\s*\"action\":\s*\"SYSTEM_COMMAND\"[\s\S]*?\]\s*\]/);
+    if (arrMatch) {
       try {
-        const cmd = JSON.parse(cmdMatch[0]);
-        const prefix = resp.slice(0, resp.indexOf(cmdMatch[0])).trim();
+        const cmds = JSON.parse(arrMatch[0]);
+        const prefix = resp.slice(0, resp.indexOf(arrMatch[0])).trim();
         if (prefix) addMsg(prefix, 'jarvis');
-        addMsg('Executing: ' + (cmd.command || 'command') + '...', 'system');
-        // Execute simple commands locally via fetch to Python server
-        // For typed input, we can't run Python commands — just notify
-      } catch(e) {
-        addMsg(resp, 'jarvis');
+        if (Array.isArray(cmds) && cmds.length > 0) {
+          addMsg('Executing ' + cmds.length + ' steps: ' + cmds.map(c => c.command).join(', ') + '...', 'system');
+          handled = true;
+        }
+      } catch(e) {}
+    }
+    // Try single command
+    if (!handled) {
+      const cmdMatch = resp.match(/\{"action":"SYSTEM_COMMAND"[\s\S]*?\}/);
+      if (cmdMatch) {
+        try {
+          const cmd = JSON.parse(cmdMatch[0]);
+          const prefix = resp.slice(0, resp.indexOf(cmdMatch[0])).trim();
+          if (prefix) addMsg(prefix, 'jarvis');
+          addMsg('Executing: ' + (cmd.command || 'command') + '...', 'system');
+          handled = true;
+        } catch(e) {}
       }
-    } else {
+    }
+    if (!handled) {
       addMsg(resp, 'jarvis');
     }
     setStatus('speaking', 'Speaking...');
