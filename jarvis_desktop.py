@@ -169,9 +169,8 @@ def mic_thread_fn():
     barge_consec     = 0
     BARGE_TRIGGER    = 4     # consecutive speech blocks to trigger barge-in
 
-    global _speaking_started_at, _barge_cooldown_until
-
     def callback(indata, frames, time_info, status):
+        global _speaking_started_at, _barge_cooldown_until
         nonlocal in_speech, silence_count, speech_buffer
         nonlocal barge_consec
 
