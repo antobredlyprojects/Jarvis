@@ -54,11 +54,8 @@ SPEECH_PAD_MS   = 300            # ms of silence after speech before cutting
 MIN_SPEECH_MS   = 400            # ignore segments shorter than this
 MAX_SPEECH_SEC  = 15             # hard cap on a single utterance
 
-# Barge-in tuning — prevents JARVIS from interrupting himself
-SPEAKING_GRACE_MS   = 1500       # ignore mic for first 1.5s after TTS starts (speaker echo)
-BARGE_TRIGGER       = 12         # consecutive speech blocks needed (~384ms) to trigger barge-in
-BARGE_COOLDOWN_MS   = 800        # ignore mic for 800ms after a barge-in (prevents re-trigger)
-SPEAKING_VAD_BOOST  = 0.25       # raise VAD threshold by this much while speaking (harder to trigger)
+# Barge-in disabled during TTS — speaker echo makes it unreliable.
+# To re-enable, uncomment the barge-in logic in mic_thread_fn callback.
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  KOKORO TTS  — load pipeline once at startup
@@ -118,9 +115,8 @@ def get_state() -> str:
 _speech_segment_queue : queue.Queue = queue.Queue()   # raw np arrays → STT thread
 _interrupt_event      : threading.Event = threading.Event()
 
-# Barge-in timing state
+# TTS timing state
 _speaking_started_at  : float   = 0.0    # timestamp when TTS started playing
-_barge_cooldown_until : float   = 0.0    # timestamp until which barge-in is disabled after interrupt
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI BRIDGE  (fire-and-forget, never blocks)
@@ -170,7 +166,6 @@ def mic_thread_fn():
     BARGE_TRIGGER    = 4     # consecutive speech blocks to trigger barge-in
 
     def callback(indata, frames, time_info, status):
-        global _speaking_started_at, _barge_cooldown_until
         nonlocal in_speech, silence_count, speech_buffer
         nonlocal barge_consec
 
@@ -179,34 +174,12 @@ def mic_thread_fn():
         now = time.time()
 
         # ── BARGE-IN (while JARVIS is speaking) ──────────────────────────────
+        # Completely ignore mic during TTS — speaker echo makes barge-in
+        # unreliable on most hardware. User can interrupt by pressing a key
+        # or waiting for JARVIS to finish.
         if state == State.SPEAKING:
-            # Grace period: ignore mic for first N ms after TTS starts
-            # This prevents speaker echo from triggering barge-in
-            elapsed = (now - _speaking_started_at) * 1000
-            if elapsed < SPEAKING_GRACE_MS:
-                barge_consec = 0
-                return
-
-            # Cooldown: ignore mic for N ms after a recent barge-in
-            if now < _barge_cooldown_until:
-                barge_consec = 0
-                return
-
-            # Raise VAD threshold while speaking (harder to trigger)
-            effective_threshold = VAD_THRESHOLD + SPEAKING_VAD_BOOST
-            conf = vad_is_speech(chunk)
-            if conf >= effective_threshold:
-                barge_consec += 1
-                if barge_consec >= BARGE_TRIGGER:
-                    print("[Barge-in] User interrupted JARVIS.")
-                    _interrupt_event.set()
-                    # Don't call sd.stop() here — let TTS worker handle it
-                    # to avoid race condition
-                    barge_consec = 0
-                    _barge_cooldown_until = time.time() + (BARGE_COOLDOWN_MS / 1000)
-            else:
-                barge_consec = max(0, barge_consec - 1)
-            return   # don't accumulate speech while JARVIS talks
+            barge_consec = 0
+            return
 
         barge_consec = 0   # reset when not speaking
 
