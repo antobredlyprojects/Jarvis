@@ -170,6 +170,7 @@ def mic_thread_fn():
     barge_buffer     = []   # accumulate audio during barge-in for capture
 
     def callback(indata, frames, time_info, status):
+        global _barge_cooldown_until
         nonlocal in_speech, silence_count, speech_buffer
         nonlocal barge_consec, barge_buffer
 
